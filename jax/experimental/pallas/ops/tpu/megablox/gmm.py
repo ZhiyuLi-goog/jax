@@ -600,6 +600,7 @@ def gmm(
         "tiling",
         "num_actual_groups",
         "interpret",
+        "quant",
     ],
 )
 def tgmm(
