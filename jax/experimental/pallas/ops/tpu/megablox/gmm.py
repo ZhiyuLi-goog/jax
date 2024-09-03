@@ -25,7 +25,10 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.megablox import common
 import jax.numpy as jnp
 
+from aqt.jax.v2 import pallas as aqt_pl
+from aqt.jax.v2 import aqt_tensor
 
+QTensor = aqt_tensor.QTensor
 partial = functools.partial
 
 
@@ -309,6 +312,7 @@ LutFn = Callable[[int, int, int], Optional[tuple[int, int, int]]]
         "tiling",
         "transpose_rhs",
         "interpret",
+        "quant",
     ],
 )
 def gmm(
@@ -321,6 +325,7 @@ def gmm(
     existing_out: jnp.ndarray | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
+    quant: bool = False,
 ) -> jnp.ndarray:
   """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
 
@@ -336,6 +341,7 @@ def gmm(
     transpose_rhs: True if the rhs needs to be transposed.
     interpret: Whether or not to run the kernel in interpret mode, helpful for
       testing and debugging.
+    quant: Whether to quantize lhs and rhs.
 
   Returns:
     A 2d, jnp.ndarray with shape [m, n].
@@ -390,11 +396,18 @@ def gmm(
       visit_empty_groups=False,
   )
 
+  # We need to know contracting axis when we quantized lhs and rhs
+  # Thus move this code part outside of kernel.
+  if transpose_rhs:
+    dot_general_dims = (((1,), (1,)), ((), ()))
+  else:
+    dot_general_dims = (((1,), (0,)), ((), ()))
+
   def kernel(
       group_metadata,
       group_offset,
-      lhs,
-      rhs,
+      lhs: jax.Array | QTensor,
+      rhs: jax.Array | QTensor,
       existing_out,
       out,
       acc_scratch,
@@ -450,16 +463,25 @@ def gmm(
         mask_k_rem_lhs = lambda x: x
         mask_k_rem_rhs = lambda x: x
 
-      if transpose_rhs:
-        dot_general_dims = (((1,), (1,)), ((), ()))
+      if isinstance(lhs, QTensor):
+        loaded_lhs = aqt_pl.load_qtensor(lhs)
+        # Let qx: QTensor, qx = quant(x, 8 , ...)
+        # qx.dequant() == qx.qvalue * qx.scale ~= x
+        # Thus, setting qvalue to zero is equivalent to setting original tensor
+        # to zero.
+        loaded_lhs.qvalue = mask_k_rem_rhs(loaded_lhs.qvalue)
       else:
-        dot_general_dims = (((1,), (0,)), ((), ()))
+        loaded_lhs = mask_k_rem_lhs(lhs[...]).astype(input_dtype)
 
-      loaded_lhs = lhs[...]
-      loaded_rhs = rhs[...]
-      acc_scratch[...] += lax.dot_general(
-          mask_k_rem_lhs(loaded_lhs).astype(input_dtype),
-          mask_k_rem_rhs(loaded_rhs).astype(input_dtype),
+      if isinstance(rhs, QTensor):
+        loaded_rhs = aqt_pl.load_qtensor(rhs)
+        loaded_rhs.qvalue = mask_k_rem_rhs(loaded_rhs.qvalue)
+      else:
+        loaded_rhs = mask_k_rem_rhs(rhs[...]).astype(input_dtype)
+
+      acc_scratch[...] += aqt_pl.dot_general(
+          loaded_lhs,
+          loaded_rhs,
           preferred_element_type=jnp.float32,
           dimension_numbers=dot_general_dims,
       )
@@ -523,7 +545,7 @@ def gmm(
   cost_estimate = pl.CostEstimate(
       flops=flops, bytes_accessed=bytes_accessed, transcendentals=0
   )
-  call_gmm = pl.pallas_call(
+  call_gmm = aqt_pl.pallas_call(
       kernel,
       out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
       grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -543,6 +565,16 @@ def gmm(
       interpret=interpret,
       cost_estimate=cost_estimate,
   )
+
+  if quant:
+    lhs_contracting_axis, rhs_contracting_axis = dot_general_dims[0]
+    # Since block_spec.block_shape of rhs is None, the first axis is reduced
+    # inside kernel, e.g., if block_shape is (None, tn, tk) then a tensor of 
+    # shape (tn, tk) will be feteched inside kernel instead of (1, tn, tk).
+    # Therefore, we need to add one to rhs_contracting_axis.
+    rhs_contracting_axis = map(lambda x: x + 1, rhs_contracting_axis)
+    lhs = aqt_pl.quant(lhs, 8, lhs_contracting_axis)
+    rhs = aqt_pl.quant(rhs, 8, rhs_contracting_axis)
 
   out = call_gmm(
       group_metadata,
@@ -580,6 +612,7 @@ def tgmm(
     num_actual_groups: int | None = None,
     existing_out: jnp.ndarray | None = None,
     interpret: bool = False,
+    quant: bool = False,
 ) -> jnp.ndarray:
   """Compute lhs[:, sizes[i-1]:sizes[i]] @ rhs[sizes[i-1]:sizes[i], :].
 
