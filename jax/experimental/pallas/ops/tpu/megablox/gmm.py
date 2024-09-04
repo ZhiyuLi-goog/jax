@@ -478,13 +478,20 @@ def gmm(
         loaded_rhs.qvalue = mask_k_rem_rhs(loaded_rhs.qvalue)
       else:
         loaded_rhs = mask_k_rem_rhs(rhs[...]).astype(input_dtype)
-
-      acc_scratch[...] += aqt_pl.dot_general(
-          loaded_lhs,
-          loaded_rhs,
-          preferred_element_type=jnp.float32,
-          dimension_numbers=dot_general_dims,
-      )
+      if quant:
+        acc_scratch[...] += aqt_pl.dot_general(
+            loaded_lhs,
+            loaded_rhs,
+            preferred_element_type=jnp.float32,
+            dimension_numbers=dot_general_dims,
+        )
+      else:
+        acc_scratch[...] += lax.dot_general(
+            loaded_lhs,
+            loaded_rhs,
+            preferred_element_type=jnp.float32,
+            dimension_numbers=dot_general_dims,
+        )
 
       if is_last_k_tile:
         _store_accum()
@@ -672,7 +679,6 @@ def tgmm(
       num_nonzero_groups=num_actual_groups,
       visit_empty_groups=True,
   )
-
   def kernel(
       group_metadata,
       group_offset,
