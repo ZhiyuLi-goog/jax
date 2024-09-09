@@ -455,6 +455,13 @@ def gmm(
           mask[...], to_store, out[...].astype(jnp.float32)
       ).astype(preferred_element_type)
 
+    if isinstance(lhs, QTensor):
+      loaded_lhs = aqt_pl.load_qtensor(lhs)
+      loaded_rhs = aqt_pl.load_qtensor(rhs)
+    else:
+      loaded_lhs = lhs[...]
+      loaded_rhs = rhs[...]
+
     def _accum(is_last_k_tile):
       if is_last_k_tile:
         mask_k_rem_lhs = partial(mask_k_rem, dim=1)
@@ -463,21 +470,22 @@ def gmm(
         mask_k_rem_lhs = lambda x: x
         mask_k_rem_rhs = lambda x: x
 
-      if isinstance(lhs, QTensor):
-        loaded_lhs = aqt_pl.load_qtensor(lhs)
+      nonlocal loaded_lhs
+      nonlocal loaded_rhs
+
+      if isinstance(loaded_lhs, QTensor):
         # Let qx: QTensor, qx = quant(x, 8 , ...)
         # qx.dequant() == qx.qvalue * qx.scale ~= x
         # Thus, setting qvalue to zero is equivalent to setting original tensor
         # to zero.
-        loaded_lhs.qvalue = mask_k_rem_rhs(loaded_lhs.qvalue)
+        loaded_lhs.qvalue = mask_k_rem_lhs(loaded_lhs.qvalue)
       else:
-        loaded_lhs = mask_k_rem_lhs(lhs[...]).astype(input_dtype)
+        loaded_lhs = mask_k_rem_lhs(loaded_lhs).astype(input_dtype)
 
-      if isinstance(rhs, QTensor):
-        loaded_rhs = aqt_pl.load_qtensor(rhs)
+      if isinstance(loaded_rhs, QTensor):
         loaded_rhs.qvalue = mask_k_rem_rhs(loaded_rhs.qvalue)
       else:
-        loaded_rhs = mask_k_rem_rhs(rhs[...]).astype(input_dtype)
+        loaded_rhs = mask_k_rem_rhs(loaded_rhs).astype(input_dtype)
       if quant:
         acc_scratch[...] += aqt_pl.dot_general(
             loaded_lhs,
