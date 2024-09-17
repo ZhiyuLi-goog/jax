@@ -675,7 +675,7 @@ def _apply_mask_and_soft_cap(
     qk = cap_logits(qk)
   return qk
 
-
+@jax.named_scope("flash_attention_kernel")
 def flash_attention_kernel(
     # Prefetched inputs
     data_next_ref,
@@ -719,6 +719,7 @@ def flash_attention_kernel(
 
   h, i, j = pl.program_id(0), pl.program_id(1), pl.program_id(2)
 
+  @jax.named_scope("init")
   @pl.when(j == 0)
   def init():
     o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
@@ -734,6 +735,7 @@ def flash_attention_kernel(
       mask_next_ref,
   )
 
+  @jax.named_scope("body")
   def body(kv_compute_index, _):
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
     m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
@@ -803,6 +805,7 @@ def flash_attention_kernel(
     alpha_o = pltpu.repeat(alpha, head_dim_repeats, axis=1)
     o_scratch_ref[:] = alpha_o * o_scratch_ref[:] + o_curr
 
+  @jax.named_scope("run")
   @pl.when(should_run)
   def run():
     assert bkv % bkv_compute == 0
@@ -811,6 +814,7 @@ def flash_attention_kernel(
     )
     lax.fori_loop(0, num_iters, body, None, unroll=True)
 
+  @jax.named_scope("end")
   @pl.when(j == grid_width - 1)
   def end():
     l = l_scratch_ref[...]
@@ -827,6 +831,7 @@ def flash_attention_kernel(
     o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
 
 
+@jax.named_scope("_splash_attention_forward")
 @overload
 def _splash_attention_forward(
     fwd_mask_info: mask_info_lib.MaskInfo,
@@ -845,6 +850,7 @@ def _splash_attention_forward(
   ...
 
 
+@jax.named_scope("_splash_attention_forward")
 @overload
 def _splash_attention_forward(
     fwd_mask_info: mask_info_lib.MaskInfo,
@@ -870,6 +876,7 @@ def _div(dividend: int, divisor: int):
   return lax.div(dividend, divisor)
 
 
+@jax.named_scope("_splash_attention_forward")
 def _splash_attention_forward(
     fwd_mask_info: mask_info_lib.MaskInfo,
     q: jax.Array,
@@ -1245,6 +1252,7 @@ def _splash_attention_fwd(
   )
 
 
+@jax.named_scope("_flash_attention_dq_kernel")
 def _flash_attention_dq_kernel(
     # Prefetched inputs
     data_next_ref,
@@ -1279,6 +1287,8 @@ def _flash_attention_dq_kernel(
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
 
   h, i, j = pl.program_id(0), pl.program_id(1), pl.program_id(2)
+
+  @jax.named_scope("init")
   @pl.when(j == 0)
   def init():
     dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
@@ -1286,6 +1296,8 @@ def _flash_attention_dq_kernel(
   global_kv_index, _, should_run, should_not_mask = _next_nonzero(
       h, i, j, data_next_ref, block_mask_ref, mask_next_ref
   )
+
+  @jax.named_scope("run")
   @pl.when(should_run)
   def run():
     q = q_ref[...] if q_layout == HEAD_DIM_MINOR else q_ref[...].T
@@ -1335,6 +1347,7 @@ def _flash_attention_dq_kernel(
         preferred_element_type=jnp.float32,
     )
 
+  @jax.named_scope("end")
   @pl.when(j == grid_width - 1)
   def end():
     dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
@@ -1655,6 +1668,8 @@ def _flash_attention_dkv_kernel(
     should_initialize = jnp.logical_and(
         should_initialize, q_head_index_per_kv_head == 0
     )
+
+  @jax.named_scope("init")
   @pl.when(should_initialize)
   def init():
     dk_scratch_ref[...] = jnp.zeros_like(dk_scratch_ref)
@@ -1670,6 +1685,7 @@ def _flash_attention_dkv_kernel(
       next_i=True,
   )
 
+  @jax.named_scope("body")
   def body(i, _):
 
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
@@ -1747,6 +1763,7 @@ def _flash_attention_dkv_kernel(
   elif dq_scratch_ref is None and dq_ref is not None:
     dq_ref[...] = jnp.zeros_like(dq_ref)
 
+  @jax.named_scope("run")
   @pl.when(should_run)
   def run():
     num_iters = (
@@ -1767,6 +1784,7 @@ def _flash_attention_dkv_kernel(
         should_write, q_head_index_per_kv_head == q_heads_per_kv_heads - 1
     )
 
+  @jax.named_scope("end")
   @pl.when(should_write)
   def end():
     dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
@@ -2243,6 +2261,7 @@ def _splash_attention_bwd(
 _splash_attention_custom.defvjp(_splash_attention_fwd, _splash_attention_bwd)
 
 
+@jax.named_scope("_splash_attention")
 @partial(
     jax.jit,
     static_argnames=[
