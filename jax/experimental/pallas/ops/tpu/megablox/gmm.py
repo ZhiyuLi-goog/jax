@@ -15,6 +15,7 @@
 """Grouped matrix multiplication kernels for TPU written in Pallas."""
 
 from collections.abc import Callable
+import dataclasses
 import functools
 from typing import Any, Optional
 
@@ -440,7 +441,10 @@ def gmm(
 
       orig_dtype = x.dtype
       iota = lax.broadcasted_iota(jnp.int32, x.shape, dim)
-      x = x.astype(jnp.float32)
+      if not quant:
+        x = x.astype(jnp.float32)
+      else:
+        x = x.astype(jnp.int32)
       return jnp.where(iota < k_rem, x, 0).astype(orig_dtype)
 
     def _store_accum():
@@ -478,12 +482,16 @@ def gmm(
         # qx.dequant() == qx.qvalue * qx.scale ~= x
         # Thus, setting qvalue to zero is equivalent to setting original tensor
         # to zero.
-        loaded_lhs.qvalue = mask_k_rem_lhs(loaded_lhs.qvalue)
+        qvalue = mask_k_rem_lhs(lhs.qvalue[...])
+        loaded_lhs = dataclasses.replace(lhs, qvalue=qvalue)
+        loaded_lhs = aqt_pl.load_qtensor(loaded_lhs)
       else:
         loaded_lhs = mask_k_rem_lhs(loaded_lhs).astype(input_dtype)
 
       if isinstance(loaded_rhs, QTensor):
-        loaded_rhs.qvalue = mask_k_rem_rhs(loaded_rhs.qvalue)
+        qvalue = mask_k_rem_rhs(rhs.qvalue[...])
+        loaded_rhs = dataclasses.replace(rhs, qvalue=qvalue)
+        loaded_rhs = aqt_pl.load_qtensor(loaded_rhs)
       else:
         loaded_rhs = mask_k_rem_rhs(loaded_rhs).astype(input_dtype)
       if quant:
@@ -542,6 +550,8 @@ def gmm(
   else:
     in_out_block_spec = out_block_spec
     input_output_aliases = {6: 0}
+    if quant:
+      input_output_aliases = {8: 0}
 
   lhs_block_spec = pl.BlockSpec((tm, tk), lhs_transform_indices)
   if transpose_rhs:
@@ -560,26 +570,54 @@ def gmm(
   cost_estimate = pl.CostEstimate(
       flops=flops, bytes_accessed=bytes_accessed, transcendentals=0
   )
-  call_gmm = aqt_pl.pallas_call(
-      kernel,
-      out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
-      grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=2,
-          in_specs=[
-              lhs_block_spec,
-              rhs_block_spec,
-              in_out_block_spec,
-          ],
-          out_specs=out_block_spec,
-          grid=(tiles_n, num_active_tiles, tiles_k),
-          scratch_shapes=[pltpu.VMEM((tm, tn), jnp.float32)],
-      ),
-      input_output_aliases=input_output_aliases,
-      compiler_params=pltpu.TPUCompilerParams(
-              dimension_semantics=("parallel", "arbitrary", "arbitrary")),
-      interpret=interpret,
-      cost_estimate=cost_estimate,
-  )
+  if quant:
+    call_gmm = aqt_pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[
+                lhs_block_spec,
+                rhs_block_spec,
+                in_out_block_spec,
+            ],
+            out_specs=out_block_spec,
+            grid=(tiles_n, num_active_tiles, tiles_k),
+            scratch_shapes=[pltpu.VMEM((tm, tn), jnp.float32)],
+        ),
+        input_output_aliases=input_output_aliases,
+        compiler_params=dict(
+            mosaic=dict(
+                dimension_semantics=("parallel", "arbitrary", "arbitrary"),
+            )
+        ),
+        cost_estimate=cost_estimate,
+        interpret=interpret,
+    )
+  else:
+    call_gmm = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[
+                lhs_block_spec,
+                rhs_block_spec,
+                in_out_block_spec,
+            ],
+            out_specs=out_block_spec,
+            grid=(tiles_n, num_active_tiles, tiles_k),
+            scratch_shapes=[pltpu.VMEM((tm, tn), jnp.float32)],
+        ),
+        input_output_aliases=input_output_aliases,
+        compiler_params=dict(
+            mosaic=dict(
+                dimension_semantics=("parallel", "arbitrary", "arbitrary"),
+            )
+        ),
+        cost_estimate=cost_estimate,
+        interpret=interpret,
+    )
 
   if quant:
     lhs_contracting_axis, rhs_contracting_axis = dot_general_dims[0]
@@ -589,7 +627,7 @@ def gmm(
     # Therefore, we need to add one to rhs_contracting_axis.
     rhs_contracting_axis = map(lambda x: x + 1, rhs_contracting_axis)
     lhs = aqt_pl.quant(lhs, 8, lhs_contracting_axis)
-    rhs = aqt_pl.quant(rhs, 8, rhs_contracting_axis)
+    rhs = aqt_pl.quant(rhs, 8, list(rhs_contracting_axis))
 
   out = call_gmm(
       group_metadata,
